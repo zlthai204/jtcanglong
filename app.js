@@ -1,5 +1,4 @@
 
-/* Dữ liệu khu vực. Có thể bổ sung/sửa trực tiếp trong AREAS. */
 const DEFAULT_AREAS={
 "Thị trấn Càng Long":["Khóm 1","Khóm 2","Khóm 3","Khóm 4","Khóm 5","Khóm 6","Khóm 7","Khóm 8","Khóm 9","Khóm 10"],
 "Tân An":["Ấp Tân An Chợ","Ấp Tân Tiến","Ấp Tân Trung","Ấp Trà Ốp","Ấp Đại An","Ấp Cả Chương","Ấp Nhà Thờ","Ấp Long Hội"],
