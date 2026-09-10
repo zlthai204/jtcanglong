@@ -1,0 +1,306 @@
+/* ShipArea Pro - Supabase client
+   Không Auth / không phân quyền.
+   Hỗ trợ cả tên anonKey (đang dùng trong app) và publishableKey nếu sau này đổi tên.
+*/
+(function(){
+  const STORAGE_KEY = "SA_SUPABASE_CONFIG";
+  let client = null;
+  let syncing = false;
+  let loading = false;
+  let dutyCloudReady = false;
+
+  const base = window.SHIPAREA_SUPABASE_CONFIG || {};
+  const now = () => new Date().toISOString();
+  const cfg = () => {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "null") || base; }
+    catch { return base; }
+  };
+  const keyOf = c => c?.anonKey || c?.publishableKey || "";
+  const saveCfg = c => localStorage.setItem(STORAGE_KEY, JSON.stringify(c));
+
+  function setStatus(text, kind="") {
+    const el = document.getElementById("cloudStatus");
+    if (el) { el.textContent = text; el.className = "cloudStatus " + kind; }
+  }
+
+  function ensure(showError=false) {
+    const c = cfg();
+    const k = keyOf(c);
+    if (!c?.url || !k || !window.supabase?.createClient) {
+      client = null;
+      setStatus("☁️ Chưa kết nối", "");
+      if (showError) throw new Error("Thiếu Supabase URL hoặc Publishable/anon key.");
+      return null;
+    }
+    try {
+      if (!client || client.__shipareaUrl !== c.url || client.__shipareaKey !== k) {
+        client = window.supabase.createClient(c.url.replace(/\/$/, ""), k, {
+          auth: { persistSession:false, autoRefreshToken:false, detectSessionInUrl:false }
+        });
+        client.__shipareaUrl = c.url;
+        client.__shipareaKey = k;
+      }
+      setStatus("☁️ Đã kết nối DB", "ok");
+      return client;
+    } catch (e) {
+      client = null;
+      setStatus("☁️ Lỗi kết nối", "err");
+      if (showError) throw e;
+      return null;
+    }
+  }
+
+  const routeId = (area,route) => btoa(unescape(encodeURIComponent(`${area}::${route}`))).replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
+  const setupId = (date,area) => btoa(unescape(encodeURIComponent(`${date}::${area}`))).replace(/=+$/,'').replace(/\+/g,'-').replace(/\//g,'_');
+  const entryId = (setup,index) => `${setup}::${index}`;
+  const uniq = a => [...new Set(a)];
+
+  function payloadToRows(payload){
+    const areas = payload.areas || {};
+    const communes = Object.keys(areas).map((name,i)=>({name,source:"ShipArea Pro",sort_order:i,updated_at:now()}));
+    const routes = [];
+    Object.entries(areas).forEach(([area,rs])=>rs.forEach((name,i)=>routes.push({id:routeId(area,name),commune_name:area,name,sort_order:i,updated_at:now()})));
+
+    const shippers = (payload.shippers||[]).map(s=>({
+      id:String(s.id), name:s.name||"", phone:s.phone||"", status:s.status||"work",
+      inactive_reason:s.inactiveReason||null, inactive_at:s.inactiveAt||null,
+      commune_name:s.area||null, updated_at:now()
+    }));
+
+    const shipperRoutes = [];
+    (payload.shippers||[]).forEach(s=>(s.routes||[]).forEach(r=>{
+      if ((areas[s.area]||[]).some(x=>x===r)) shipperRoutes.push({shipper_id:String(s.id),route_id:routeId(s.area,r)});
+    }));
+
+    const off = [];
+    Object.entries(payload.schedules||{}).forEach(([date,list])=>(list||[]).forEach(o=>off.push({
+      id:`${date}::${o.offId}`, work_date:date, off_shipper_id:String(o.offId),
+      replace_shipper_id:o.replaceId?String(o.replaceId):null, note:o.note||"", updated_at:now()
+    })));
+
+    const setup=[]; const entries=[]; const entryRoutes=[];
+    Object.entries(payload.setupRecords||{}).forEach(([date,byArea])=>Object.entries(byArea||{}).forEach(([area,rec])=>{
+      const sid=setupId(date,area);
+      setup.push({id:sid,work_date:date,commune_name:area,raw_text:rec.raw||"",auto_added:uniq(rec.autoAdded||[]),updated_at:rec.updatedAt||now()});
+      (rec.entries||[]).forEach((e,i)=>{
+        const eid=entryId(sid,i);
+        entries.push({id:eid,setup_id:sid,entry_index:i,shipper_id:e.shipperId?String(e.shipperId):null,shipper_name_snapshot:e.name||"",off:!!e.off,note:e.note||""});
+        (e.routes||[]).forEach((r,j)=>entryRoutes.push({entry_id:eid,route_id:(areas[area]||[]).includes(r)?routeId(area,r):null,route_name_snapshot:r,route_index:j}));
+      });
+    }));
+
+    const dutyRoster=[];
+    Object.entries(payload.dutyRoster||{}).forEach(([shift,obj])=>Object.entries(obj.days||{}).forEach(([day,names])=>(names||[]).forEach((name,i)=>dutyRoster.push({id:`${shift}::${day}::${i}`,shift,weekday:Number(day),person_name:name,sort_order:i,updated_at:now()}))));
+    const duty=[];
+    Object.entries(payload.dutyAttendance||{}).forEach(([date,byShift])=>Object.entries(byShift||{}).forEach(([shift,people])=>Object.entries(people||{}).forEach(([name,st])=>duty.push({id:`${date}::${shift}::${name}`,work_date:date,shift,shipper_name:name,checked:!!st.checked,present:st.present===null?null:!!st.present,updated_at:st.updatedAt||now()}))));
+
+    const paste=[];
+    Object.entries(payload.pasteLog||{}).forEach(([date,areasDone])=>(areasDone||[]).forEach(area=>paste.push({work_date:date,commune_name:area,updated_at:now()})));
+    return {communes,routes,shippers,shipperRoutes,off,setup,entries,entryRoutes,paste,duty,dutyRoster};
+  }
+
+  async function replaceAll(payload){
+    const sb=ensure(true);
+    const r=payloadToRows(payload);
+    // v21: ĐỒNG BỘ AN TOÀN. Không DELETE ALL nữa. Cloud chỉ được upsert/bổ sung
+    // snapshot hiện tại, tránh reload hoặc local thiếu dữ liệu làm mất DB.
+    const batches=[
+      ["sa_communes",r.communes,"name"],
+      ["sa_routes",r.routes,"id"],
+      ["sa_shippers",r.shippers,"id"],
+      ["sa_shipper_routes",r.shipperRoutes,"shipper_id,route_id"],
+      ["sa_off_records",r.off,"id"],
+      ["sa_setup_records",r.setup,"id"],
+      ["sa_setup_entries",r.entries,"id"],
+      ["sa_setup_entry_routes",r.entryRoutes,"entry_id,route_index"],
+      ["sa_paste_days",r.paste,"work_date,commune_name"]
+    ];
+    for(const [table,rows,onConflict] of batches){
+      if(!rows.length) continue;
+      for(let i=0;i<rows.length;i+=500){
+        const {error}=await sb.from(table).upsert(rows.slice(i,i+500),{onConflict});
+        if(error) throw error;
+      }
+    }
+    return true;
+  }
+
+  async function saveDuty(attendance){
+    const sb=ensure(); if(!sb || !dutyCloudReady)return false;
+    const rows=[];
+    Object.entries(attendance||{}).forEach(([date,byShift])=>Object.entries(byShift||{}).forEach(([shift,people])=>Object.entries(people||{}).forEach(([name,st])=>rows.push({id:`${date}::${shift}::${name}`,work_date:date,shift,shipper_name:name,checked:!!st.checked,present:st.present===null?null:!!st.present,updated_at:st.updatedAt||now()}))));
+    if(!rows.length)return true;
+    const probe=await sb.from('sa_vehicle_duty_records').select('id').limit(1);
+    if(probe.error){setStatus('☁️ Chưa có bảng trực xe','err');return false;}
+    for(let i=0;i<rows.length;i+=500){const {error}=await sb.from('sa_vehicle_duty_records').upsert(rows.slice(i,i+500),{onConflict:'id'});if(error)throw error;}
+    setStatus('☁️ Đã lưu trực xe','ok');return true;
+  }
+
+  async function saveDutyRoster(roster){
+    const sb=ensure(); if(!sb || !dutyCloudReady)return false;
+    const rows=[]; Object.entries(roster||{}).forEach(([shift,obj])=>Object.entries(obj.days||{}).forEach(([day,names])=>(names||[]).forEach((name,i)=>rows.push({id:`${shift}::${day}::${i}`,shift,weekday:Number(day),person_name:name,sort_order:i,updated_at:now()}))));
+    if(!dutyCloudReady){setStatus('☁️ Chưa bật Cloud trực xe','err');return false;}
+    const probe=await sb.from('sa_vehicle_duty_roster').select('id').limit(1);
+    if(probe.error){setStatus('☁️ Chưa có bảng lịch trực xe','err');return false;}
+    const {error:del}=await sb.from('sa_vehicle_duty_roster').delete().neq('id',''); if(del)throw del;
+    for(let i=0;i<rows.length;i+=500){const {error}=await sb.from('sa_vehicle_duty_roster').insert(rows.slice(i,i+500));if(error)throw error;}
+    setStatus('☁️ Đã lưu lịch trực xe','ok'); return true;
+  }
+
+  async function enableDutyCloud(){
+    const sb=ensure(true);
+    const recordProbe=await sb.from("sa_vehicle_duty_records").select("id").limit(1);
+    const rosterProbe=await sb.from("sa_vehicle_duty_roster").select("id").limit(1);
+    const recordsOk=!recordProbe.error, rosterOk=!rosterProbe.error;
+    if(!recordsOk && !rosterOk){
+      dutyCloudReady=false;
+      setStatus("☁️ Chưa có bảng trực xe", "err");
+      alert("Supabase chưa có bảng trực xe. Hãy chạy SQL TRỰC XE trong supabase-schema.sql rồi thử lại.");
+      return false;
+    }
+    dutyCloudReady=true; localStorage.setItem("SA_DUTY_TABLE_READY","1");
+    setStatus(recordsOk&&rosterOk?"☁️ Trực xe Cloud đầy đủ":"☁️ Trực xe Cloud một phần", recordsOk&&rosterOk?"ok":"err");
+    try{
+      const fresh=await load();
+      if(fresh?.payload) window.shipAreaApplyCloud?.({dutyAttendance:fresh.payload.dutyAttendance,dutyRoster:fresh.payload.dutyRoster});
+    }catch(e){console.warn("Tải lại lịch trực xe:",e);}
+    return true;
+  }
+
+  async function load(){
+    const sb=ensure();
+    if(!sb) return null;
+    loading=true;
+    try{
+      const names=["sa_communes","sa_routes","sa_shippers","sa_shipper_routes","sa_off_records","sa_setup_records","sa_setup_entries","sa_setup_entry_routes","sa_paste_days"];
+      if(dutyCloudReady){ names.push("sa_vehicle_duty_records"); names.push("sa_vehicle_duty_roster"); }
+      const res={};
+      for(const t of names){
+        const {data,error}=await sb.from(t).select("*");
+        if(error){
+          if((t==='sa_vehicle_duty_records'||t==='sa_vehicle_duty_roster') && /relation .*sa_vehicle_duty_(records|roster).*does not exist|Could not find the table|PGRST205/i.test(error.message||'')){res[t]=[]; if(t==='sa_vehicle_duty_records'){dutyCloudReady=false;localStorage.removeItem('SA_DUTY_TABLE_READY');} continue;}
+          throw error;
+        }
+        res[t]=data||[];
+      }
+
+      const areas={};
+      res.sa_communes.forEach(c=>areas[c.name]=[]);
+      res.sa_routes
+        .sort((a,b)=>(a.commune_name.localeCompare(b.commune_name,'vi')||a.sort_order-b.sort_order))
+        .forEach(r=>{areas[r.commune_name]??=[];areas[r.commune_name].push(r.name)});
+
+      const shippers=res.sa_shippers.map(s=>({id:s.id,name:s.name,phone:s.phone||"",status:s.status||"work",inactiveReason:s.inactive_reason||"",inactiveAt:s.inactive_at||"",area:s.commune_name||"",routes:[]}));
+      const shipMap=new Map(shippers.map(s=>[s.id,s]));
+      const routeMap=new Map(res.sa_routes.map(r=>[r.id,r]));
+      res.sa_shipper_routes.forEach(x=>{const s=shipMap.get(x.shipper_id),r=routeMap.get(x.route_id);if(s&&r)s.routes.push(r.name)});
+
+      const schedules={};
+      res.sa_off_records.forEach(o=>(schedules[o.work_date]??=[]).push({offId:o.off_shipper_id,replaceId:o.replace_shipper_id||"",note:o.note||""}));
+
+      const setupRecords={}; const setupMap=new Map();
+      res.sa_setup_records.forEach(r=>{
+        setupMap.set(r.id,r);
+        setupRecords[r.work_date]??={};
+        setupRecords[r.work_date][r.commune_name]={area:r.commune_name,date:r.work_date,raw:r.raw_text||"",updatedAt:r.updated_at,autoAdded:Array.isArray(r.auto_added)?r.auto_added:[],entries:[]};
+      });
+      const entryMap=new Map();
+      res.sa_setup_entries.sort((a,b)=>a.entry_index-b.entry_index).forEach(e=>{
+        const r=setupMap.get(e.setup_id); if(!r)return;
+        const rec=setupRecords[r.work_date][r.commune_name];
+        const obj={name:e.shipper_name_snapshot||"",shipperId:e.shipper_id||"",routes:[],off:!!e.off,note:e.note||""};
+        rec.entries.push(obj); entryMap.set(e.id,obj);
+      });
+      res.sa_setup_entry_routes.sort((a,b)=>a.route_index-b.route_index).forEach(x=>{const e=entryMap.get(x.entry_id);if(e)e.routes.push(x.route_name_snapshot)});
+
+      const pasteLog={};
+      res.sa_paste_days.forEach(x=>(pasteLog[x.work_date]??=[]).push(x.commune_name));
+      const dutyAttendance={};
+      (res.sa_vehicle_duty_records||[]).forEach(x=>{dutyAttendance[x.work_date]??={};dutyAttendance[x.work_date][x.shift]??={};dutyAttendance[x.work_date][x.shift][x.shipper_name]={checked:!!x.checked,present:x.present===null?null:!!x.present,updatedAt:x.updated_at};});
+
+      const dutyRoster={};
+      (res.sa_vehicle_duty_roster||[]).sort((a,b)=>a.sort_order-b.sort_order).forEach(x=>{dutyRoster[x.shift]??={days:{}};dutyRoster[x.shift].days[x.weekday]??=[];dutyRoster[x.shift].days[x.weekday].push(x.person_name);});
+
+      const hasData = Object.keys(areas).length>0 || shippers.length>0 || Object.keys(schedules).length>0 || Object.keys(setupRecords).length>0 || Object.keys(pasteLog).length>0 || Object.keys(dutyAttendance).length>0 || Object.keys(dutyRoster).length>0;
+      return {
+        payload:{areas,shippers,schedules,pasteLog,setupRecords,dutyAttendance,dutyRoster},
+        meta:{hasData, source:"supabase"}
+      };
+    } finally { loading=false; }
+  }
+
+  async function save(payload){
+    if(syncing || loading) return;
+    if(!ensure()) return;
+    syncing=true;
+    try { await replaceAll(payload); setStatus("☁️ Đã đồng bộ DB","ok"); }
+    catch(e){ console.warn("Supabase save:",e); setStatus("☁️ Lỗi đồng bộ","err"); throw e; }
+    finally { syncing=false; }
+  }
+
+  window.shipAreaCloudLoad=load;
+  window.shipAreaCloudSave=save;
+  window.shipAreaCloudSaveDuty=saveDuty;
+  window.shipAreaCloudSaveDutyRoster=saveDutyRoster;
+  window.shipAreaEnableDutyCloud=()=>enableDutyCloud();
+  window.shipAreaCloudRefreshStatus=()=>ensure();
+
+  window.openCloudSettings=()=>{
+    const c=cfg();
+    document.getElementById("sbUrl").value=c?.url||"";
+    document.getElementById("sbKey").value=keyOf(c);
+    document.getElementById("cloudMessage").textContent="";
+    document.getElementById("cloudModal").classList.add("show");
+  };
+
+  window.closeCloudSettings=()=>document.getElementById("cloudModal").classList.remove("show");
+
+  window.connectCloud=async()=>{
+    const url=document.getElementById("sbUrl").value.trim().replace(/\/$/,"");
+    const anonKey=document.getElementById("sbKey").value.trim();
+    const msg=document.getElementById("cloudMessage");
+    if(!url||!anonKey){msg.textContent="Vui lòng nhập đủ Project URL và Publishable/anon key.";return;}
+    saveCfg({url,anonKey});
+    client=null;
+    try{
+      const p=await load();
+      if(p?.payload && p?.meta?.hasData){
+        msg.textContent="✓ Kết nối thành công. Database đang có dữ liệu.";
+        if(confirm("Supabase đang có dữ liệu. Bạn muốn tải dữ liệu cloud xuống ứng dụng và thay dữ liệu đang có trên máy này không?")) window.shipAreaApplyCloud?.(p.payload);
+      }else{
+        msg.textContent="✓ Kết nối thành công. Database đang trống.";
+        if(window.shipAreaGetPayload){
+          if(confirm("Database đang trống. Đồng bộ dữ liệu hiện có trên máy này lên Supabase ngay không?")) await save(window.shipAreaGetPayload());
+        }
+      }
+    }catch(e){msg.textContent="✕ Kết nối thất bại: "+(e.message||e);setStatus("☁️ Lỗi kết nối","err");}
+  };
+
+  window.pushCloudNow=async()=>{
+    const msg=document.getElementById("cloudMessage");
+    try{
+      const payload=window.shipAreaGetPayload?.();
+      if(!payload) throw new Error("Ứng dụng chưa sẵn sàng");
+      await save(payload);
+      msg.textContent="✓ Đã đồng bộ dữ liệu vào Supabase.";
+    }catch(e){msg.textContent="✕ Đồng bộ thất bại: "+(e.message||e);}
+  };
+
+  window.pullCloudNow=async()=>{
+    const msg=document.getElementById("cloudMessage");
+    try{
+      const p=await load();
+      if(!p?.payload) throw new Error("Không tải được dữ liệu");
+      window.shipAreaApplyCloud?.(p.payload);
+      msg.textContent="✓ Đã tải dữ liệu mới nhất từ Supabase.";
+    }catch(e){msg.textContent="✕ Tải thất bại: "+(e.message||e);}
+  };
+
+  window.disconnectCloud=()=>{
+    localStorage.removeItem(STORAGE_KEY);
+    client=null;
+    setStatus("☁️ Chưa kết nối","");
+    const msg=document.getElementById("cloudMessage");
+    if(msg) msg.textContent="Đã ngắt cấu hình cloud trên trình duyệt này. Dữ liệu local vẫn còn.";
+  };
+})();
